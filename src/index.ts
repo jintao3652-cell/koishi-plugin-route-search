@@ -111,7 +111,8 @@ export function apply(ctx: Context, config: Config) {
   const TEMP_DIR = join(ctx.baseDir, 'route-temp')
   const airports: Record<string, { icao: string; iata: string; name: string }> = {}
 
-  const workbook = XLSX.readFile(join(__dirname, 'airports.xlsx'))
+  const airportsPath = join(__dirname, '..', 'assets', 'airports.xlsx')
+  const workbook = XLSX.readFile(airportsPath)
 const sheet = workbook.Sheets[workbook.SheetNames[0]]
 const rows = XLSX.utils.sheet_to_json(sheet) as any[]
 
