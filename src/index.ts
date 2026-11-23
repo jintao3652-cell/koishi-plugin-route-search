@@ -22,6 +22,7 @@ export interface Config {
   imageHeight: number
   screenshotquality: number
   pageautoclose: boolean
+  mapboxAccessToken: string
 }
 
 interface RouteWaypoint {
@@ -106,6 +107,7 @@ export const Config: Schema<Config> = Schema.object({
     code: Schema.string().required(),
     description: Schema.string().required(),
   })).role('table').default([/* ... your default cloud coverage map here ... */]),
+  mapboxAccessToken: Schema.string().role('secret').default('').description('Mapbox access token（留空则不显示地图）'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -198,6 +200,23 @@ for (const row of rows) {
       }
     })
 
+    // nodeinformation 缺失时用 parseRoute 补齐航路点坐标
+    if (!waypoints.length && routeDataRaw.route) {
+      const routeText = Array.isArray(routeDataRaw.route) ? routeDataRaw.route.join(' ') : String(routeDataRaw.route)
+      const parsed = await axios.post(`${HOST}/api/efb/parseRoute`, null, {
+        params: { route: routeText, dep, arr, cycle },
+        timeout: 10000,
+      }).catch(() => null)
+      const points = parsed?.data?.code === 20000 ? (parsed.data.data?.waypoints || []) : []
+      for (const point of points) {
+        const latValue = Number(point.lat)
+        const lonValue = Number(point.lon)
+        if (Number.isFinite(latValue) && Number.isFinite(lonValue)) {
+          waypoints.push({ name: point.name || '', lat: latValue, lon: lonValue })
+        }
+      }
+    }
+
     // 组合数据
     const routeData: RouteData = {
       ...routeDataRaw,
@@ -225,7 +244,7 @@ for (const row of rows) {
       depTaf,
       arrTaf,
       routeData,
-    })
+    }, config.mapboxAccessToken || '')
     mkdirSync(TEMP_DIR, { recursive: true })
     const htmlPath = join(TEMP_DIR, `${dep}-${arr}.html`)
     writeFileSync(htmlPath, html)
@@ -235,6 +254,7 @@ for (const row of rows) {
     try {
       await page.setViewport({ width: Math.max(320, config.imageWidth), height: Math.max(320, config.imageHeight) })
       await page.goto('file://' + htmlPath, { waitUntil: 'networkidle0' })
+      await page.waitForFunction('window.__mapReady === true', { timeout: 20000 }).catch(() => {})
       const contentWidth = await page.evaluate(() => Math.ceil(Math.max(
         document.documentElement.scrollWidth,
         document.body.scrollWidth,
@@ -264,7 +284,7 @@ for (const row of rows) {
 }
 
 // 渲染 HTML 页面内容
-function renderHtml(data: RenderHtmlData): string {
+function renderHtml(data: RenderHtmlData, mapboxToken = ''): string {
   const { dep, arr, cycle, depMetar, arrMetar, depTaf, arrTaf, routeData } = data
   const waypointList = routeData.waypoints || []
   const depLat = waypointList[0]?.lat || 0
@@ -280,8 +300,8 @@ function renderHtml(data: RenderHtmlData): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>航路查询</title>
-  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.js"></script>
   <style>
     * {
       margin: 0;
@@ -785,276 +805,162 @@ function renderHtml(data: RenderHtmlData): string {
   </div>
 
   <script>
-    // 初始化地图
-    const depLat = ${depLat};
-    const depLon = ${depLon};
-    const arrLat_js = ${arrLat};
-    const arrLon_js = ${arrLon};
-    const waypoints = ${JSON.stringify(waypointList)};
-    
-    // 创建地图
-    window.map = undefined;
-    let map;
-    try {
-      map = L.map('map').setView([(depLat + arrLat_js) / 2, (depLon + arrLon_js) / 2], 4);
-      window.map = map;
-      
-      // 添加地图图层
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        maxZoom: 18
-      }).addTo(map);
-      
-      // 添加起飞机场标记
-      const depMarker = L.marker([depLat, depLon], {
-        icon: L.divIcon({
-          html: '<div style="background: #4CAF50; color: white; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 2px solid white;">DEP</div>',
-          className: '',
-          iconSize: [36, 36]
-        })
-      }).addTo(map).bindPopup('${dep}<br>起飞机场');
-      
-      // 添加目的地机场标记
-      const arrMarker = L.marker([arrLat_js, arrLon_js], {
-        icon: L.divIcon({
-          html: '<div style="background: #F44336; color: white; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; font-weight: bold; border: 2px solid white;">ARR</div>',
-          className: '',
-          iconSize: [36, 36]
-        })
-      }).addTo(map).bindPopup('${arr}<br>目的地机场');
-      
-      // 平滑曲线函数（使用贝塞尔曲线）
-      function getCurvePoints(start, end, waypoints) {
-        const points = [start];
-        const numSegments = waypoints.length + 1;
-        
-        for (let i = 0; i <= numSegments; i++) {
-          const t = i / numSegments;
-          const lat = start[0] + (end[0] - start[0]) * t;
-          const lon = start[1] + (end[1] - start[1]) * t;
-          
-          // 添加中间控制点偏移
-          if (i > 0 && i < numSegments) {
-            const wp = waypoints[i - 1];
-            points.push([lat + (wp.lat - lat) * 0.7, lon + (wp.lon - lon) * 0.7]);
-          }
-        }
-        
-        points.push(end);
-        return points;
+    window.__mapReady = false;
+    (function () {
+      const depIcao = ${JSON.stringify(dep)};
+      const arrIcao = ${JSON.stringify(arr)};
+      const depLat = ${depLat}, depLon = ${depLon};
+      const arrLat = ${arrLat}, arrLon = ${arrLon};
+      const waypoints = ${JSON.stringify(waypointList)};
+      const TOKEN = ${JSON.stringify(mapboxToken || '')};
+      const mapEl = document.getElementById('map');
+
+      function finish() {
+        if (!window.__mapReady) window.__mapReady = true;
       }
-      
-      // 创建航路点标记和连线
-      const waypointMarkers = [];
-      let routePolyline = null;
-      
-      // 更新进度条
-      function updateProgress(percent) {
-        document.getElementById('progressBar').style.width = percent + '%';
+      function setProgress(percent) {
+        const bar = document.getElementById('progressBar');
+        if (bar) bar.style.width = percent + '%';
       }
-      
-      // 绘制航路
-      function drawRoute() {
-        updateProgress(0);
-        
-        // 清除现有路线
-        if (routePolyline) {
-          map.removeLayer(routePolyline);
+      function loadMapbox() {
+        if (window.mapboxgl) return Promise.resolve();
+        const sources = [
+          'https://api.mapbox.com/mapbox-gl-js/v3.12.0/mapbox-gl.js',
+          'https://cdn.jsdelivr.net/npm/mapbox-gl@3.12.0/dist/mapbox-gl.js',
+          'https://unpkg.com/mapbox-gl@3.12.0/dist/mapbox-gl.js',
+        ];
+        return new Promise(function (resolve, reject) {
+          let index = 0;
+          (function next() {
+            if (index >= sources.length) return reject(new Error('Mapbox 脚本加载失败'));
+            const script = document.createElement('script');
+            script.src = sources[index++];
+            script.async = true;
+            script.onload = function () { window.mapboxgl ? resolve() : next(); };
+            script.onerror = next;
+            document.head.appendChild(script);
+          })();
+        });
+      }
+
+      loadMapbox().then(function () {
+        if (!TOKEN) {
+          mapEl.innerHTML = '<div class="error-box">未配置 Mapbox access token</div>';
+          setProgress(100);
+          finish();
+          return;
         }
-        
-        // 清除现有航路点标记
-        waypointMarkers.forEach(marker => map.removeLayer(marker));
-        waypointMarkers.length = 0;
-        
-        const startPoint = [depLat, depLon];
-        const endPoint = [arrLat_js, arrLon_js];
-        let routePoints = [];
-        
-        if (waypoints.length > 0) {
-          // 使用平滑曲线
-          routePoints = getCurvePoints(startPoint, endPoint, waypoints);
-          
-          // 添加航路点标记
-          for (let i = 0; i < waypoints.length; i++) {
-            updateProgress((i / waypoints.length) * 70);
-            
-            const wp = waypoints[i];
-            const isFirst = i === 0;
-            const isLast = i === waypoints.length - 1;
-            let color = '#2196F3';
-            
-            if (isFirst) color = '#4CAF50';
-            if (isLast) color = '#F44336';
-            
-            const marker = L.marker([wp.lat, wp.lon], {
-              icon: L.divIcon({
-                html: \`<div style="background: \${color}; color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; border: 2px solid white;">\${wp.name}</div>\`,
-                className: '',
-                iconSize: [24, 24]
-              })
-            }).addTo(map);
-            
-            // 创建弹窗内容
-            let popupContent = \`<b>\${wp.name}</b><br>\`;
-            popupContent += \`坐标: \${wp.lat.toFixed(4)}, \${wp.lon.toFixed(4)}<br>\`;
-            if (wp.alt) popupContent += \`高度: FL\${wp.alt}<br>\`;
-            if (wp.freq) popupContent += \`频率: \${wp.freq}MHz\`;
-            
-            marker.bindPopup(popupContent);
-            waypointMarkers.push(marker);
+        mapboxgl.accessToken = TOKEN;
+        const map = new mapboxgl.Map({
+          container: mapEl,
+          style: 'mapbox://styles/mapbox/dark-v11',
+          center: [(depLon + arrLon) / 2, (depLat + arrLat) / 2],
+          zoom: 4,
+          preserveDrawingBuffer: true,
+        });
+        window.map = map;
+        const markerEntries = [];
+
+        function addMarker(name, lat, lon, color) {
+          const element = document.createElement('div');
+          element.textContent = name;
+          element.style.cssText = 'background:' + color + ';color:#fff;border-radius:50%;width:26px;height:26px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:bold;border:2px solid #fff;';
+          const marker = new mapboxgl.Marker({ element: element, anchor: 'center' })
+            .setLngLat([lon, lat]).addTo(map);
+          markerEntries.push({ name: name, marker: marker });
+          return marker;
+        }
+
+        map.on('load', function () {
+          const coords = waypoints
+            .filter(function (point) { return isFinite(point.lat) && isFinite(point.lon) && !(point.lat === 0 && point.lon === 0); })
+            .map(function (point) { return [point.lon, point.lat]; });
+
+          if (coords.length >= 2) {
+            map.addSource('route', {
+              type: 'geojson',
+              data: { type: 'Feature', geometry: { type: 'LineString', coordinates: coords } },
+            });
+            map.addLayer({
+              id: 'route-line', type: 'line', source: 'route',
+              layout: { 'line-cap': 'round', 'line-join': 'round' },
+              paint: { 'line-color': '#2196F3', 'line-width': 3 },
+            });
           }
-          
-          // 添加动画路径
-          routePolyline = L.polyline(routePoints, {
-            color: '#2196F3',
-            weight: 3,
-            opacity: 0.8,
-            dashArray: '10, 10',
-            lineCap: 'round'
-          }).addTo(map);
-          
-          // 添加路径动画
-          let animatedIndex = 0;
-          const animatePath = () => {
-            if (animatedIndex <= routePoints.length) {
-              const partialPath = routePoints.slice(0, animatedIndex);
-              if (routePolyline) {
-                map.removeLayer(routePolyline);
-              }
-              
-              routePolyline = L.polyline(partialPath, {
-                color: '#2196F3',
-                weight: 3,
-                opacity: 0.8
-              }).addTo(map);
-              
-              animatedIndex++;
-              setTimeout(animatePath, 30);
-              updateProgress(70 + (animatedIndex / routePoints.length) * 30);
+
+          if (isFinite(depLat) && isFinite(depLon)) addMarker(depIcao, depLat, depLon, '#4CAF50');
+          if (isFinite(arrLat) && isFinite(arrLon)) addMarker(arrIcao, arrLat, arrLon, '#F44336');
+
+          const seen = {};
+          waypoints.forEach(function (point) {
+            if (!isFinite(point.lat) || !isFinite(point.lon)) return;
+            if (point.lat === 0 && point.lon === 0) return;
+            if (!point.name || point.name === depIcao || point.name === arrIcao) return;
+            if (seen[point.name]) return;
+            seen[point.name] = true;
+            addMarker(point.name, point.lat, point.lon, '#2196F3');
+          });
+
+          const bounds = new mapboxgl.LngLatBounds();
+          if (isFinite(depLat) && isFinite(depLon)) bounds.extend([depLon, depLat]);
+          if (isFinite(arrLat) && isFinite(arrLon)) bounds.extend([arrLon, arrLat]);
+          coords.forEach(function (coord) { bounds.extend(coord); });
+          try { map.fitBounds(bounds, { padding: 50, maxZoom: 9, duration: 0 }); } catch (e) {}
+
+          setProgress(100);
+          map.once('idle', finish);
+        });
+
+        map.on('error', function () { setProgress(100); finish(); });
+
+        if (document.getElementById('waypointSearch')) {
+          const searchInput = document.getElementById('waypointSearch');
+          const searchButton = document.getElementById('searchButton');
+          function searchWaypoint() {
+            const term = (searchInput.value || '').trim().toUpperCase();
+            if (!term) return;
+            const found = markerEntries.find(function (entry) { return entry.name === term; });
+            if (found) {
+              map.flyTo({ center: found.marker.getLngLat(), zoom: 8, duration: 0 });
+            } else {
+              alert('未找到航路点: ' + term);
             }
-          };
-          
-          setTimeout(animatePath, 500);
-        } else {
-          // 没有航路点时绘制直线
-          routePolyline = L.polyline([startPoint, endPoint], {
-            color: '#FF9800',
-            weight: 2,
-            dashArray: '10, 10',
-          }).addTo(map).bindPopup('未获取到航路点，显示直线路径');
-          updateProgress(100);
-        }
-      }
-      
-      // 初始绘制
-      drawRoute();
-      
-      // 添加缩放控件
-      L.control.zoom({ position: 'topright' }).addTo(map);
-      
-      // 调整视图
-      function adjustView() {
-        try {
-          map.invalidateSize();
-          if (waypoints.length > 0) {
-            const bounds = new L.LatLngBounds();
-            bounds.extend([depLat, depLon]);
-            bounds.extend([arrLat_js, arrLon_js]);
-            map.fitBounds(bounds, { padding: [50, 50] });
           }
-          updateProgress(100);
-        } catch (e) {
-          console.error('地图调整失败:', e);
+          searchButton.addEventListener('click', searchWaypoint);
+          searchInput.addEventListener('keypress', function (event) {
+            if (event.key === 'Enter') searchWaypoint();
+          });
         }
-      }
-      
-      // 使用防抖优化窗口调整
-      let resizeTimer;
-      window.addEventListener('resize', () => {
-        clearTimeout(resizeTimer);
-        resizeTimer = setTimeout(adjustView, 250);
+      }).catch(function (error) {
+        mapEl.innerHTML = '<div class="error-box">地图加载失败: ' + error.message + '</div>';
+        setProgress(100);
+        finish();
       });
-      
-      // 初始调整视图
-      setTimeout(adjustView, 500);
-    } catch (e) {
-      console.error('地图初始化失败:', e);
-      document.getElementById('map').innerHTML = '<div class="error-box">地图加载失败: ' + e.message + '</div>';
-    }
-    
-    // 主题切换功能
-    const themeToggle = document.getElementById('themeToggle');
-    themeToggle.addEventListener('click', () => {
-      document.body.classList.toggle('dark-mode');
-      themeToggle.textContent = document.body.classList.contains('dark-mode') 
-        ? '☀️ 浅色模式' 
-        : '🌙 深色模式';
-    });
-    
-    // 折叠功能
-    document.querySelectorAll('.collapse-btn').forEach(btn => {
-      btn.addEventListener('click', function() {
-        const card = this.closest('.airport-card');
-        const content = card.querySelector('.airport-info');
-        const isCollapsed = content.style.display === 'none';
-        
-        content.style.display = isCollapsed ? 'block' : 'none';
-        this.textContent = isCollapsed ? '−' : '+';
-      });
-    });
-    
-    // 航路点搜索功能
-    if (document.getElementById('waypointSearch')) {
-      const searchInput = document.getElementById('waypointSearch');
-      const searchButton = document.getElementById('searchButton');
-      
-      function searchWaypoint() {
-        const searchTerm = searchInput.value.trim().toUpperCase();
-        if (!searchTerm) return;
-        
-        // 清除之前的高亮
-        waypointMarkers.forEach(marker => {
-          const originalHtml = marker.getPopup().getContent().match(/<div style="[^"]*">(.*?)<\/div>/)[1];
-          marker.setIcon(L.divIcon({
-            html:
-              '<div style="background: ' +
-              marker.options.icon.options.html.match(/background: ([^;]+)/)[1] +
-              '; color: white; border-radius: 50%; width: 24px; height: 24px; display: flex; align-items: center; ' +
-              'justify-content: center; font-size: 12px; font-weight: bold; border: 2px solid white;">' +
-              originalHtml +
-              '</div>',
-            className: '',
-            iconSize: [24, 24]
-          }));
+
+      // 主题切换功能
+      const themeToggle = document.getElementById('themeToggle');
+      if (themeToggle) {
+        themeToggle.addEventListener('click', function () {
+          document.body.classList.toggle('dark-mode');
+          themeToggle.textContent = document.body.classList.contains('dark-mode')
+            ? '☀️ 浅色模式'
+            : '🌙 深色模式';
         });
-        
-        // 查找匹配的航路点
-        const found = waypointMarkers.find(function(marker) {
-          const markerName = marker.getPopup().getContent().match(/<b>(.*?)<\/b>/)[1];
-          return markerName === searchTerm;
-        });
-        
-        if (found) {
-          // 高亮显示
-          found.setIcon(L.divIcon({
-            html: '<div style="background: #FFEB3B; color: #333; border-radius: 50%; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: bold; border: 2px solid white; box-shadow: 0 0 10px yellow;">' + searchTerm + '</div>',
-            className: '',
-            iconSize: [28, 28]
-          }));
-          (window.map || map).setView(found.getLatLng(), 8);
-          found.openPopup();
-          map.setView(found.getLatLng(), 8);
-          found.openPopup();
-        } else {
-          alert('未找到航路点: ' + searchTerm);
-        }
       }
-      
-      searchButton.addEventListener('click', searchWaypoint);
-      searchInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') searchWaypoint();
+
+      // 折叠功能
+      document.querySelectorAll('.collapse-btn').forEach(function (button) {
+        button.addEventListener('click', function () {
+          const card = this.closest('.airport-card');
+          const content = card.querySelector('.airport-info');
+          const isCollapsed = content.style.display === 'none';
+          content.style.display = isCollapsed ? 'block' : 'none';
+          this.textContent = isCollapsed ? '−' : '+';
+        });
       });
-    }
+
+      setTimeout(finish, 15000);
+    })();
   </script>
 </body>
 </html>`;
